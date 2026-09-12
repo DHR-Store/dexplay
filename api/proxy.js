@@ -1,53 +1,30 @@
-// Vercel serverless function — mirrors the Vite dev middleware in vite.config.js.
-// Lives at https://<your-app>.vercel.app/api/proxy?url=<encoded target>
-//
-// Sets Origin / Referer / Host headers that the upstream services
-// (epsiloncloud.org, cnv.cx, youtube oembed) expect, so their responses
-// come back with a 200 instead of a 403 or 404. Browser never sees CORS.
-
 import https from 'node:https'
 
-/* we handle the raw request body ourselves — no built-in parser */
-export const config = {
-  api: { bodyParser: false }
-}
+export const config = { api: { bodyParser: false } }
 
 const UA =
   'Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 ' +
   '(KHTML, like Gecko) Chrome/152.0.0.0 Mobile Safari/537.36'
 
-/* which Origin/Referer an upstream host expects */
 function originForHost(host) {
   if (
     host.includes('cnv.cx') ||
     host.includes('youtube.com') ||
     host.includes('ytimg.com')
   ) {
-    return {
-      origin:  'https://frame.y2meta-uk.com',
-      referer: 'https://frame.y2meta-uk.com/'
-    }
+    return { origin: 'https://frame.y2meta-uk.com', referer: 'https://frame.y2meta-uk.com/' }
   }
   if (host.includes('epsiloncloud.org')) {
-    return {
-      origin:  'https://convertytmp3.org',
-      referer: 'https://convertytmp3.org/'
-    }
+    return { origin: 'https://convertytmp3.org', referer: 'https://convertytmp3.org/' }
   }
   return { origin: null, referer: null }
 }
 
 export default function handler(req, res) {
-  /* CORS — lets the browser tab call us without preflight trouble */
   res.setHeader('Access-Control-Allow-Origin',  '*')
   res.setHeader('Access-Control-Allow-Headers', '*')
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
-
-  if (req.method === 'OPTIONS') {
-    res.statusCode = 204
-    res.end()
-    return
-  }
+  if (req.method === 'OPTIONS') { res.statusCode = 204; res.end(); return }
 
   const target = req.query.url
   if (!target) {
@@ -61,32 +38,37 @@ export default function handler(req, res) {
   try { t = new URL(target) }
   catch {
     res.statusCode = 400
-    res.setHeader('Content-Type', 'application/json')
     res.end(JSON.stringify({ error: 'invalid url' }))
     return
   }
 
   const { origin, referer } = originForHost(t.host)
 
+  /* full browser-shaped header set */
   const headers = {
-    Host:              t.host,
-    'User-Agent':      UA,
-    'Accept-Language': 'en-GB,en-US;q=0.9,en;q=0.8,hi;q=0.7',
-    Accept:            '*/*',
-    'Cache-Control':   'no-cache',
-    Pragma:            'no-cache',
-    'Sec-Fetch-Dest':  'empty',
-    'Sec-Fetch-Mode':  'cors',
-    'Sec-Fetch-Site':  'cross-site'
+    'User-Agent':       UA,
+    'Accept':           '*/*',
+    'Accept-Language':  'en-GB,en-US;q=0.9,en;q=0.8,hi;q=0.7',
+    'Accept-Encoding':  'identity',            // let Node handle compression
+    'Cache-Control':    'no-cache',
+    'Pragma':           'no-cache',
+    'Priority':         'u=1, i',
+    'Sec-Ch-Ua':        '"Chromium";v="152", "Not?A_Brand";v="24", "Google Chrome";v="152"',
+    'Sec-Ch-Ua-Mobile': '?1',
+    'Sec-Ch-Ua-Platform': '"Android"',
+    'Sec-Fetch-Dest':   'empty',
+    'Sec-Fetch-Mode':   'cors',
+    'Sec-Fetch-Site':   'cross-site',
+    'Upgrade-Insecure-Requests': '1',
+    'X-Forwarded-For':  '49.36.0.1',           // plausible Indian residential IP
+    'X-Real-IP':        '49.36.0.1'
   }
   if (origin)  headers.Origin  = origin
   if (referer) headers.Referer = referer
 
-  /* forward Authorization + Content-Type from the caller */
-  if (req.headers.authorization)  headers.Authorization  = req.headers.authorization
+  if (req.headers.authorization)   headers.Authorization  = req.headers.authorization
   if (req.headers['content-type']) headers['Content-Type'] = req.headers['content-type']
 
-  /* read the incoming body (POST / PUT) */
   const chunks = []
   req.on('data', (c) => chunks.push(c))
   req.on('end', () => {
@@ -99,6 +81,9 @@ export default function handler(req, res) {
       path:     t.pathname + t.search,
       method:   req.method,
       headers
+      /* NOTE: not setting `Host` here — https.request already
+         emits `Host: <t.hostname>` automatically. Explicitly setting
+         it on Vercel was causing the 403. */
     }
 
     const upstream = https.request(options, (up) => {
