@@ -1,6 +1,6 @@
 // Full chain:
-//   1. searchYouTube(query)         → mp3juice search (CORS: *)
-//   2. fetchAudioUrl(videoId)       → epsiloncloud.org (via Vite proxy)
+//   1. searchYouTube(query)         → mp3juice search (direct, CORS:*)
+//   2. fetchAudioUrl(videoId)       → epsiloncloud.org through the worker
 //      - GET /api/v1/auth           → { key }
 //      - GET /api/v1/init           → { convertURL }
 //      - GET {convertURL}&v=ID&f=mp3 → first response
@@ -8,11 +8,13 @@
 //          - else → poll progressURL until progress >= 3
 //      - downloadURL                → direct MP3 stream
 //
-// The proxy at /api/proxy?url=… sets Origin/Referer per host, so
-// the browser sees same-origin calls and CORS never comes into play.
+// All upstream calls go through the Cloudflare Worker at
+// https://ytproxy.gojosa.workers.dev/?url=…
+// The worker sets Origin/Referer per host so the upstream accepts us,
+// and returns `Access-Control-Allow-Origin: *` so our app can read it.
 
 const SEARCH_API  = 'https://mw.mp3juice.blog/search.php'
-const PROXY       = '/api/proxy?url='
+const PROXY       = 'https://ytproxy.gojosa.workers.dev/?url='
 
 /* epsilon values observed in the working browser session */
 const EPS_API_KEY = '50399e2dd92c6c3087442659f268ce82'
@@ -60,12 +62,6 @@ export async function fetchMetadata(videoId) {
 
 /* =========================================================
    step 3 — epsiloncloud chain
-   Mirrors the minified `convert(url, video, format, r)`:
-
-     - strip everything from `&v=` onward, then re-append &v=&f=&_=<now>
-     - r === 1 → don't chase any further redirects, use the response as-is
-     - redirect === 1 → recurse with r = 1
-     - otherwise → use progressURL / downloadURL
    ========================================================= */
 
 async function epsilonAuth() {
@@ -90,16 +86,7 @@ async function epsilonInit(key) {
   return data.convertURL
 }
 
-/**
- * One convert round-trip.
- *   url        — base URL (either init's convertURL or a redirectURL)
- *   videoId    — YouTube id
- *   format     — 'mp3' | 'mp4'
- *   isRedirect — false for the first call, true when following a redirect
- *                (this is the `r` argument in the original minified source)
- */
 async function epsilonConvert(url, videoId, format = 'mp3', isRedirect = false) {
-  // strip everything from `&v=` onward, matching `url.split('&v=')[0]`
   let base = url
   const vi = base.indexOf('&v=')
   if (vi > -1) base = base.slice(0, vi)
@@ -114,15 +101,10 @@ async function epsilonConvert(url, videoId, format = 'mp3', isRedirect = false) 
   if (Number(data.error) > 0) {
     throw new Error(`Epsilon: convert error ${data.error}`)
   }
-
-  // r === 1 → stop chasing redirects, return what we got
   if (isRedirect) return data
-
-  // r === 0 && redirect === 1 → follow once with r = 1
   if (Number(data.redirect) === 1 && data.redirectURL) {
     return epsilonConvert(data.redirectURL, videoId, format, true)
   }
-
   return data
 }
 
@@ -136,7 +118,6 @@ async function epsilonPoll(progressURL, downloadURL, maxTries = 60) {
     if (Number(data.error) !== 0) {
       throw new Error(`Epsilon: progress error ${data.error}`)
     }
-    // progress 3 == done
     if (typeof data.progress === 'number' && data.progress >= 3) {
       return downloadURL || data.downloadURL
     }
@@ -145,29 +126,21 @@ async function epsilonPoll(progressURL, downloadURL, maxTries = 60) {
   throw new Error('Epsilon: conversion timed out')
 }
 
-/* Interprets a response — either it's ready, pollable, or still redirecting. */
 async function epsilonResolveResponse(response, videoId, format) {
   if (Number(response.error) > 0) {
     throw new Error(`Epsilon: error ${response.error}`)
   }
-
-  // 1) already done?
   if (response.downloadURL && (!response.progress || response.progress >= 3)) {
     return { url: response.downloadURL, filename: response.title || null }
   }
-
-  // 2) pollable?
   if (response.progressURL && response.downloadURL) {
     const finalUrl = await epsilonPoll(response.progressURL, response.downloadURL)
     return { url: finalUrl, filename: response.title || null }
   }
-
-  // 3) some responses carry only a redirectURL without a redirect flag
   if (response.redirectURL) {
     const followup = await epsilonConvert(response.redirectURL, videoId, format, true)
     return epsilonResolveResponse(followup, videoId, format)
   }
-
   throw new Error(
     `Epsilon: unresolved — ` +
     `redirect=${response.redirect}, ` +
@@ -183,7 +156,6 @@ async function fetchAudioUrlEpsilonOnce(videoId) {
   return epsilonResolveResponse(response, videoId, 'mp3')
 }
 
-/* Retrying wrapper — this chain is intermittent, one retry usually fixes it. */
 export async function fetchAudioUrlEpsilon(videoId, retries = 2) {
   let lastErr
   for (let i = 0; i <= retries; i++) {
@@ -201,9 +173,6 @@ export async function fetchAudioUrlEpsilon(videoId, retries = 2) {
 
 /* =========================================================
    step 4 — combined resolver
-   cnv.cx fallback removed: its converter endpoint returns
-   HTTP 400 for our requests regardless of headers, so it was
-   only producing noise in the error message.
    ========================================================= */
 export async function fetchAudioUrl(videoId) {
   return fetchAudioUrlEpsilon(videoId)
