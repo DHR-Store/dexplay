@@ -1,22 +1,23 @@
-// Full chain:
+// Chain:
 //   1. searchYouTube(query)         → mp3juice search (direct, CORS:*)
-//   2. fetchAudioUrl(videoId)       → epsiloncloud.org through the worker
-//      - GET /api/v1/auth           → { key }
-//      - GET /api/v1/init           → { convertURL }
-//      - GET {convertURL}&v=ID&f=mp3 → first response
-//          - redirect === 1 → follow redirectURL ONCE with isRedirect=true
-//          - else → poll progressURL until progress >= 3
-//      - downloadURL                → direct MP3 stream
+//   2. fetchAudioUrl(videoId)       → epsiloncloud.org via the proxy
 //
-// All upstream calls go through the Cloudflare Worker at
-// https://ytproxy.gojosa.workers.dev/?url=…
-// The worker sets Origin/Referer per host so the upstream accepts us,
-// and returns `Access-Control-Allow-Origin: *` so our app can read it.
+// Local dev: Vite middleware at /api/proxy (runs from your PC's IP)
+// Deployed:  set REMOTE_PROXY below to a working proxy URL
+//            (Cloudflare Worker / Fly.io / tunnel / whatever you pick)
 
-const SEARCH_API  = 'https://mw.mp3juice.blog/search.php'
-const PROXY       = 'https://ytproxy.gojosa.workers.dev/?url='
+const SEARCH_API   = 'https://mw.mp3juice.blog/search.php'
+const REMOTE_PROXY = 'https://ytproxy.gojosa.workers.dev/?url='  // only used off-localhost
+const LOCAL_PROXY  = '/api/proxy?url='
 
-/* epsilon values observed in the working browser session */
+const isLocalhost =
+  typeof window !== 'undefined' &&
+  (window.location.hostname === 'localhost' ||
+   window.location.hostname === '127.0.0.1')
+
+const PROXY = isLocalhost ? LOCAL_PROXY : REMOTE_PROXY
+
+/* epsilon values from the working browser session */
 const EPS_API_KEY = '50399e2dd92c6c3087442659f268ce82'
 const EPS_HOST    = 'epsilon.epsiloncloud.org'
 
@@ -171,9 +172,6 @@ export async function fetchAudioUrlEpsilon(videoId, retries = 2) {
   throw lastErr
 }
 
-/* =========================================================
-   step 4 — combined resolver
-   ========================================================= */
 export async function fetchAudioUrl(videoId) {
   return fetchAudioUrlEpsilon(videoId)
 }
