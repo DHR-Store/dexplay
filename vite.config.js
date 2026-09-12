@@ -4,8 +4,12 @@ import tailwindcss from '@tailwindcss/vite'
 import https from 'node:https'
 
 /* ---------------------------------------------------------------
-   Picks the Origin/Referer an upstream host expects. These are
-   the exact values from the browser captures that worked.
+   cnv.cx / youtube / epsiloncloud proxy as a Vite middleware.
+   Runs on your own machine (Node.js), so:
+     - no browser CORS restrictions
+     - no Cloudflare-injected headers
+     - request originates from your residential IP
+   This is why it works locally but not from Vercel / Workers.
 ---------------------------------------------------------------- */
 function originForHost(host) {
   if (
@@ -24,7 +28,6 @@ function originForHost(host) {
       referer: 'https://convertytmp3.org/'
     }
   }
-  // unknown host → don't set Origin/Referer at all
   return { origin: null, referer: null }
 }
 
@@ -32,11 +35,6 @@ const UA =
   'Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 ' +
   '(KHTML, like Gecko) Chrome/152.0.0.0 Mobile Safari/537.36'
 
-/* ---------------------------------------------------------------
-   One generic proxy middleware at /api/proxy?url=<target>.
-   Node sets the fake Origin/Referer per-host, so no CORS is
-   involved — the browser sees a same-origin call.
----------------------------------------------------------------- */
 function dynamicProxy() {
   return {
     name: 'dynamic-upstream-proxy',
@@ -44,44 +42,36 @@ function dynamicProxy() {
       server.middlewares.use('/api/proxy', (req, res) => {
         const u = new URL(req.url || '', 'http://localhost')
         const target = u.searchParams.get('url')
+
         if (!target) {
           res.statusCode = 400
-          res.setHeader('Content-Type', 'text/plain')
-          res.end('missing ?url=')
+          res.setHeader('Content-Type', 'application/json')
+          res.end(JSON.stringify({ error: 'missing ?url=' }))
           return
         }
 
         let t
         try { t = new URL(target) }
-        catch (e) {
+        catch {
           res.statusCode = 400
-          res.end('invalid url')
+          res.end(JSON.stringify({ error: 'invalid url' }))
           return
         }
 
         const { origin, referer } = originForHost(t.host)
 
         const headers = {
-          Host: t.host,
-          'User-Agent': UA,
+          'User-Agent':      UA,
+          'Accept':          '*/*',
           'Accept-Language': 'en-GB,en-US;q=0.9,en;q=0.8,hi;q=0.7',
-          Accept: '*/*',
-          'Cache-Control': 'no-cache',
-          Pragma: 'no-cache',
-          'Sec-Fetch-Dest': 'empty',
-          'Sec-Fetch-Mode': 'cors',
-          'Sec-Fetch-Site': 'cross-site'
+          'Cache-Control':   'no-cache',
+          'Pragma':          'no-cache'
         }
         if (origin)  headers.Origin  = origin
         if (referer) headers.Referer = referer
 
-        // forward auth + content-type from the browser
-        if (req.headers['authorization']) {
-          headers.Authorization = req.headers['authorization']
-        }
-        if (req.headers['content-type']) {
-          headers['Content-Type'] = req.headers['content-type']
-        }
+        if (req.headers['authorization'])  headers.Authorization  = req.headers['authorization']
+        if (req.headers['content-type'])   headers['Content-Type'] = req.headers['content-type']
 
         const chunks = []
         req.on('data', (c) => chunks.push(c))
@@ -89,24 +79,17 @@ function dynamicProxy() {
           const bodyBuf = Buffer.concat(chunks)
           if (bodyBuf.length) headers['Content-Length'] = bodyBuf.length
 
-          const options = {
+          const upstream = https.request({
             hostname: t.hostname,
-            port: t.port || 443,
-            path: t.pathname + t.search,
-            method: req.method,
+            port:     t.port || 443,
+            path:     t.pathname + t.search,
+            method:   req.method,
             headers
-          }
-
-          const upstream = https.request(options, (up) => {
+          }, (up) => {
             res.statusCode = up.statusCode || 502
-            if (up.headers['content-type']) {
-              res.setHeader('Content-Type', up.headers['content-type'])
-            }
-            if (up.headers['content-length']) {
-              res.setHeader('Content-Length', up.headers['content-length'])
-            }
-            // we still expose CORS to the local page (harmless)
-            res.setHeader('Access-Control-Allow-Origin', '*')
+            if (up.headers['content-type'])   res.setHeader('Content-Type',   up.headers['content-type'])
+            if (up.headers['content-length']) res.setHeader('Content-Length', up.headers['content-length'])
+            res.setHeader('Access-Control-Allow-Origin',  '*')
             res.setHeader('Access-Control-Allow-Headers', '*')
             res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
             up.pipe(res)
